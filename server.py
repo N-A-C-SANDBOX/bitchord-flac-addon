@@ -75,8 +75,11 @@ MIME_TYPES = {
     ".mp3": "audio/mpeg",
 }
 
+# Official Mornye registry (web/JS extensions with built-in session handling).
+# Override with MORNYE_REGISTRIES to use e.g. the PY-Audio Python providers
+# (those need working upstream API endpoints configured separately).
 DEFAULT_REGISTRY = (
-    "https://raw.githubusercontent.com/moto-costiera/PY-Audio/main/registry.json"
+    "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/registry.json"
 )
 
 
@@ -108,7 +111,9 @@ _raw_services = os.getenv(
     "MORNYE_SERVICES",
     os.getenv(
         "SPOTIFY_SERVICES",
-        "ext:qobuz-py,ext:tidal-py,ext:deezer-py,ext:amazon-py",
+        # Official web extensions (work without external API proxy config).
+        # For PY-Audio natives use: ext:qobuz-py,ext:tidal-py,ext:deezer-py,ext:amazon-py
+        "ext:qobuz-web,ext:tidal-web,ext:deezer,ext:amazon",
     ),
 )
 MORNYE_SERVICES = [s.strip() for s in _raw_services.split(",") if s.strip()]
@@ -228,9 +233,15 @@ def bootstrap_mornye_extensions():
                         )
             installed.discard("")
 
-        # Prefer the Python-native providers from the PY-Audio registry
+        # Install whichever providers match the configured services list,
+        # plus common aliases from both official and PY-Audio registries.
         wanted = [
             "utilities",
+            "spotify-web",
+            "qobuz-web",
+            "tidal-web",
+            "deezer",
+            "amazon",
             "qobuz-py",
             "tidal-py",
             "deezer-py",
@@ -238,6 +249,10 @@ def bootstrap_mornye_extensions():
             "soundcloud-py",
             "youtube-py",
         ]
+        for svc in MORNYE_SERVICES:
+            ext_id = svc[4:] if svc.startswith("ext:") else svc
+            if ext_id and ext_id not in wanted:
+                wanted.append(ext_id)
         for reg_url in MORNYE_REGISTRIES:
             try:
                 reg_data = _http_get(reg_url, timeout=12, as_json=True)
