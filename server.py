@@ -348,22 +348,34 @@ def base_url():
 def extract_track_ref(text, allow_bare=False):
     """
     Returns ('sp', '<22-char-spotify-id>') or ('dz', '<deezer-id>') or (None, None).
+    Accepts: Spotify URL/URI, sp:<id>, dz:<id>, dz-<id> (cache key form), bare IDs.
     """
     text = (text or "").strip()
     for rx in (SPOTIFY_URL_RE, SPOTIFY_URI_RE):
         m = rx.search(text)
         if m:
             return "sp", m.group(1)
-    if text.lower().startswith(SPOTIFY_PREFIX):
+    lower = text.lower()
+    if lower.startswith(SPOTIFY_PREFIX):
         candidate = text[len(SPOTIFY_PREFIX) :]
         if SPOTIFY_ID_RE.match(candidate):
             return "sp", candidate
+        # Nested forms: sp:dz:123 or sp:dz-123
         if candidate.lower().startswith(DEEZER_PREFIX):
             dz_cand = candidate[len(DEEZER_PREFIX) :]
             if DEEZER_ID_RE.match(dz_cand):
                 return "dz", dz_cand
-    if text.lower().startswith(DEEZER_PREFIX):
+        if candidate.lower().startswith("dz-"):
+            dz_cand = candidate[3:]
+            if DEEZER_ID_RE.match(dz_cand):
+                return "dz", dz_cand
+    if lower.startswith(DEEZER_PREFIX):
         candidate = text[len(DEEZER_PREFIX) :]
+        if DEEZER_ID_RE.match(candidate):
+            return "dz", candidate
+    # Cache-key form produced by resolve_download_target when Spotify mapping fails
+    if lower.startswith("dz-"):
+        candidate = text[3:]
         if DEEZER_ID_RE.match(candidate):
             return "dz", candidate
     if allow_bare:
@@ -402,15 +414,17 @@ def make_track(track_ref, title, artist, album, duration, art, base):
 def resolve_deezer_to_spotify_id(dz_id):
     """
     Convert a Deezer track ID into a 22-character Spotify Track ID using:
-    1) Songlink / Odesli API (https://api.song.link)
-    2) MusicBrainz ISRC lookup -> Spotify URL relation
+    1) Songlink / Odesli API
+    2) Deezer ISRC -> MusicBrainz -> Spotify relation
+    3) Title/artist web search on open.spotify.com
+    Returns None when no mapping is found (caller may fall back to Deezer URL).
     """
     dz_id = str(dz_id).strip()
     cached = dz_to_sp_cache.get(dz_id)
     if cached:
         return cached
 
-    # Method 1: Odesli / Songlink API (free, keyless, instant)
+    # Method 1: Odesli / Songlink API
     try:
         dz_url = urllib.parse.quote(f"https://www.deezer.com/track/{dz_id}", safe="")
         data = _http_get(
@@ -425,9 +439,39 @@ def resolve_deezer_to_spotify_id(dz_id):
     except Exception as exc:
         log.debug("Songlink lookup for dz:%s failed: %r", dz_id, exc)
 
-    # Method 2: DuckDuckGo Lite / HTML scrape for open.spotify.com/track/
+    dz_meta = None
+    # Method 2: Deezer metadata + ISRC via MusicBrainz
     try:
         dz_meta = _http_get(f"https://api.deezer.com/track/{dz_id}", timeout=6)
+        isrc = (dz_meta.get("isrc") or "").strip()
+        if isrc:
+            mb = _http_get(
+                f"https://musicbrainz.org/ws/2/recording?query=isrc:{urllib.parse.quote(isrc)}&fmt=json",
+                headers={"User-Agent": "LayzAddon/3.1 (https://github.com/layz)"},
+                timeout=10,
+            )
+            recs = mb.get("recordings") or []
+            if recs:
+                rid = recs[0].get("id")
+                if rid:
+                    det = _http_get(
+                        f"https://musicbrainz.org/ws/2/recording/{rid}?inc=url-rels&fmt=json",
+                        headers={"User-Agent": "LayzAddon/3.1 (https://github.com/layz)"},
+                        timeout=10,
+                    )
+                    for rel in det.get("relations") or []:
+                        url = ((rel.get("url") or {}).get("resource") or "")
+                        _, sp_id = extract_track_ref(url)
+                        if sp_id:
+                            dz_to_sp_cache.set(dz_id, sp_id, 24 * 3600)
+                            return sp_id
+    except Exception as exc:
+        log.debug("ISRC/MusicBrainz lookup for dz:%s failed: %r", dz_id, exc)
+
+    # Method 3: title/artist DuckDuckGo scrape
+    try:
+        if dz_meta is None:
+            dz_meta = _http_get(f"https://api.deezer.com/track/{dz_id}", timeout=6)
         title = dz_meta.get("title") or ""
         artist = (dz_meta.get("artist") or {}).get("name") or ""
         if title and artist:
@@ -671,7 +715,7 @@ def cleanup_loop():
             log.exception("cache cleanup failed")
 
 
-async def _mornye_download(track_id, out_dir):
+async def _mornye_download(source_url, out_dir):
     from mornye import AsyncMornye
 
     os.environ["MORNYE_PROGRESS_BARS"] = "0"
@@ -685,76 +729,83 @@ async def _mornye_download(track_id, out_dir):
         quality="LOSSLESS",
         allow_fallback=True,
     ) as client:
-        await client.download_track(f"https://open.spotify.com/track/{track_id}")
+        await client.download_track(source_url)
 
 
-def resolve_to_spotify_id(identifier):
-    """Accepts sp:<id>, dz:<id>, or bare ID and returns a 22-char Spotify track ID."""
+def resolve_download_target(identifier):
+    """
+    Accepts sp:<id>, dz:<id>, or bare ID.
+
+    Returns (cache_key, source_url) where:
+      - cache_key is used for on-disk cache folders (22-char Spotify ID or dz-<id>)
+      - source_url is what Mornye will download (Spotify preferred, Deezer fallback)
+    """
     kind, ref_id = extract_track_ref(identifier, allow_bare=True)
     if kind == "sp":
-        return ref_id
+        return ref_id, f"https://open.spotify.com/track/{ref_id}"
     if kind == "dz":
         sp_id = resolve_deezer_to_spotify_id(ref_id)
-        if not sp_id:
-            raise RuntimeError(
-                f"Could not resolve Deezer track {ref_id} to a Spotify track ID"
-            )
-        return sp_id
+        if sp_id:
+            return sp_id, f"https://open.spotify.com/track/{sp_id}"
+        # No Spotify mapping — download via Deezer URL (deezer-py / other providers
+        # match by metadata). Cache under a stable dz- key.
+        cache_key = f"dz-{ref_id}"
+        return cache_key, f"https://www.deezer.com/track/{ref_id}"
     raise RuntimeError("Invalid track identifier")
 
 
 def ensure_spotify_file(identifier, retry=False):
-    """Return (spotify_track_id, cached_audio_path), downloading if needed."""
-    track_id = resolve_to_spotify_id(identifier)
+    """Return (cache_key, cached_audio_path), downloading if needed."""
+    cache_key, source_url = resolve_download_target(identifier)
 
-    final_dir = os.path.join(CACHE_DIR, track_id)
+    final_dir = os.path.join(CACHE_DIR, cache_key)
 
-    with _lock_for(track_id):
+    with _lock_for(cache_key):
         existing = _find_audio(final_dir) if os.path.isdir(final_dir) else None
         if _valid(existing):
             os.utime(final_dir, None)
-            return track_id, existing
+            return cache_key, existing
 
         if retry:
-            failure_cache.delete(track_id)
+            failure_cache.delete(cache_key)
         else:
-            previous = failure_cache.get(track_id)
+            previous = failure_cache.get(cache_key)
             if previous:
                 raise RuntimeError(f"{previous} (cached failure, add ?retry=1 to retry)")
 
         tmp_dir = os.path.join(
-            CACHE_DIR, f".{track_id}.part-{os.getpid()}-{int(time.time())}"
+            CACHE_DIR, f".{cache_key}.part-{os.getpid()}-{int(time.time())}"
         )
         os.makedirs(tmp_dir, exist_ok=True)
         started = time.time()
-        log.info("download start: %s", track_id)
+        log.info("download start: %s (%s)", cache_key, source_url)
 
         try:
             with _download_slots:
                 asyncio.run(
                     asyncio.wait_for(
-                        _mornye_download(track_id, tmp_dir), DOWNLOAD_TIMEOUT
+                        _mornye_download(source_url, tmp_dir), DOWNLOAD_TIMEOUT
                     )
                 )
         except asyncio.TimeoutError:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             msg = f"download timed out after {DOWNLOAD_TIMEOUT}s"
-            failure_cache.set(track_id, msg, min(FAIL_TTL, 60))
-            log.error("download %s: %s", track_id, msg)
+            failure_cache.set(cache_key, msg, min(FAIL_TTL, 60))
+            log.error("download %s: %s", cache_key, msg)
             raise RuntimeError(msg)
         except Exception as exc:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             msg = f"Mornye failed: {exc}"
-            failure_cache.set(track_id, msg, FAIL_TTL)
-            log.exception("download %s failed", track_id)
+            failure_cache.set(cache_key, msg, FAIL_TTL)
+            log.exception("download %s failed", cache_key)
             raise RuntimeError(msg) from exc
 
         path = _find_audio(tmp_dir)
         if not _valid(path):
             shutil.rmtree(tmp_dir, ignore_errors=True)
             msg = "Lossless file not found on any installed Mornye extension/provider"
-            failure_cache.set(track_id, msg, FAIL_TTL)
-            log.error("download %s: %s", track_id, msg)
+            failure_cache.set(cache_key, msg, FAIL_TTL)
+            log.error("download %s: %s", cache_key, msg)
             raise RuntimeError(msg)
 
         shutil.rmtree(final_dir, ignore_errors=True)
@@ -764,14 +815,14 @@ def ensure_spotify_file(identifier, retry=False):
         final_path = _find_audio(final_dir)
         log.info(
             "download done: %s %s (%.1f MB, %.1fs)",
-            track_id,
+            cache_key,
             os.path.basename(final_path),
             os.path.getsize(final_path) / 1048576,
             time.time() - started,
         )
 
-    evict(protect=track_id)
-    return track_id, final_path
+    evict(protect=cache_key)
+    return cache_key, final_path
 
 
 purge_on_start()
