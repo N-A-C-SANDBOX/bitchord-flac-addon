@@ -1,45 +1,66 @@
 #!/usr/bin/env python3
 """
-Layz Add On – Internet Archive FLAC + Spotify FLAC (via SpotiFLAC)
+Layz Add On – Spotify lossless (FLAC) add-on for BitChord
 
-Spotify tracks are downloaded on the server into a temporary folder, served
-through /file/<track_id> (with HTTP Range support for seeking) and removed
-automatically after CACHE_TTL seconds.
+* Search by song name (spotipy) or by pasted Spotify link / URI / sp:<id>
+* Audio is fetched with SpotiFLAC into a temporary server cache and streamed
+  through /file/<track_id> (HTTP Range supported, so seeking works)
+
+Caching
+-------
+* Search results  : in-memory, CACHE_SEARCH_TTL seconds
+* Track metadata  : in-memory, 24 h
+* Audio files     : CACHE_DIR, deleted CACHE_TTL seconds after last use
+                    and trimmed (oldest first) when CACHE_MAX_MB is exceeded
+* Downloads are written to a hidden ".part" folder and moved into place only
+  when complete, so half-downloaded files are never served
+* One download per track at a time, MAX_DOWNLOADS in parallel overall
+* Failed downloads are remembered for FAIL_TTL seconds (no hammering providers)
+* Leftovers from a previous run are purged on start-up
 
 Environment variables
 ---------------------
-PORT                   Port to listen on                       (default 8080)
-PUBLIC_URL             Public base URL of this server          (e.g. https://addon.example.com)
-                       Falls back to the incoming request host if not set.
-SPOTIFY_CLIENT_ID      Optional – enables Spotify text search through spotipy
-SPOTIFY_CLIENT_SECRET  Optional – same as above
-CACHE_DIR              Temp folder for downloads               (default <system tmp>/layz_spotify)
-CACHE_TTL              Seconds to keep a downloaded file       (default 3600)
-SPOTIFY_SERVICES       Comma list of SpotiFLAC providers       (default deezer,qobuz,amazon,tidal)
-
-Install
--------
-pip install flask requests SpotiFLAC spotipy
+PORT                   default 8080
+PUBLIC_URL             public https base URL (e.g. https://addon.example.com)
+SPOTIFY_CLIENT_ID      required for searching by name
+SPOTIFY_CLIENT_SECRET  required for searching by name
+SPOTIFY_SERVICES       default deezer,qobuz,amazon,tidal
+CACHE_DIR              default <tmp>/layz_spotify
+CACHE_TTL              default 3600   (seconds an unused track stays on disk)
+CACHE_MAX_MB           default 2048   (max total size of the audio cache)
+CACHE_SEARCH_TTL       default 600
+MAX_DOWNLOADS          default 2
+DOWNLOAD_TIMEOUT       default 150    (keep below the gunicorn --timeout)
+FAIL_TTL               default 300
+DEBUG_ENDPOINTS        default 1      (set 0 to disable /debug/*)
 """
 import asyncio
+import logging
 import os
 import re
 import shutil
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote
 
-import requests
-from flask import Flask, abort, jsonify, request, send_file
+from flask import Flask, abort, g, jsonify, request, send_file
+
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,
+)
+log = logging.getLogger("layz")
 
 app = Flask(__name__)
 
 MANIFEST = {
     "id": "bitchord-internet-archive-flac",
     "name": "Layz Add On",
-    "version": "1.7.0",
+    "version": "2.0.0",
     "resources": ["search", "stream"],
     "settings": [
         {
@@ -51,27 +72,12 @@ MANIFEST = {
                 {"label": "High", "value": "high"},
                 {"label": "Low", "value": "low"},
             ],
-        },
-        {
-            "key": "source",
-            "type": "select",
-            "default": "all",
-            "options": [
-                {"label": "All sources", "value": "all"},
-                {"label": "Spotify (FLAC)", "value": "spotify"},
-                {"label": "Internet Archive", "value": "archive"},
-            ],
-        },
+        }
     ],
 }
 
-IA_SEARCH = "https://archive.org/advancedsearch.php"
-IA_METADATA = "https://archive.org/metadata/{}"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Layz-Add-On/1.7 BitChord"})
-
 # --------------------------------------------------------------------------- #
-# Spotify / temporary storage configuration
+# Configuration
 # --------------------------------------------------------------------------- #
 SPOTIFY_PREFIX = "sp:"
 SPOTIFY_ID_RE = re.compile(r"^[A-Za-z0-9]{22}$")
@@ -88,17 +94,73 @@ MIME_TYPES = {
     ".mp3": "audio/mpeg",
 }
 
+
+def _int_env(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 CACHE_DIR = os.getenv("CACHE_DIR") or os.path.join(tempfile.gettempdir(), "layz_spotify")
-CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
+CACHE_TTL = _int_env("CACHE_TTL", 3600)
+CACHE_MAX_BYTES = _int_env("CACHE_MAX_MB", 2048) * 1024 * 1024
+CACHE_SEARCH_TTL = _int_env("CACHE_SEARCH_TTL", 600)
+MAX_DOWNLOADS = max(_int_env("MAX_DOWNLOADS", 2), 1)
+DOWNLOAD_TIMEOUT = _int_env("DOWNLOAD_TIMEOUT", 150)
+FAIL_TTL = _int_env("FAIL_TTL", 300)
+DEBUG_ENDPOINTS = os.getenv("DEBUG_ENDPOINTS", "1") == "1"
 SPOTIFY_SERVICES = [
     s.strip()
     for s in os.getenv("SPOTIFY_SERVICES", "deezer,qobuz,amazon,tidal").split(",")
     if s.strip()
 ]
+
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# Small in-memory TTL cache
+# --------------------------------------------------------------------------- #
+class TTLCache:
+    def __init__(self, maxsize=500):
+        self._data = {}
+        self._lock = threading.Lock()
+        self._maxsize = maxsize
+
+    def get(self, key):
+        with self._lock:
+            item = self._data.get(key)
+            if not item:
+                return None
+            expires, value = item
+            if expires < time.time():
+                self._data.pop(key, None)
+                return None
+            return value
+
+    def set(self, key, value, ttl):
+        with self._lock:
+            if len(self._data) >= self._maxsize:
+                now = time.time()
+                for k in [k for k, (exp, _) in self._data.items() if exp < now]:
+                    self._data.pop(k, None)
+                if len(self._data) >= self._maxsize:
+                    self._data.pop(next(iter(self._data)), None)
+            self._data[key] = (time.time() + ttl, value)
+
+    def delete(self, key):
+        with self._lock:
+            self._data.pop(key, None)
+
+
+search_cache = TTLCache()
+meta_cache = TTLCache()
+failure_cache = TTLCache()
 
 _locks_guard = threading.Lock()
 _track_locks = {}
+_download_slots = threading.BoundedSemaphore(MAX_DOWNLOADS)
 
 
 def _lock_for(track_id):
@@ -107,30 +169,33 @@ def _lock_for(track_id):
 
 
 # --------------------------------------------------------------------------- #
-# Generic helpers
+# Request logging
 # --------------------------------------------------------------------------- #
-def num(value):
-    if value in (None, ""):
-        return None
-    match = re.search(r"\d+(?:\.\d+)?", str(value))
-    if not match:
-        return None
-    number = float(match.group(0))
-    return int(number) if number.is_integer() else number
+@app.before_request
+def _start_timer():
+    g.t0 = time.time()
 
 
-def first(data, *keys):
-    for key in keys:
-        if data.get(key) not in (None, ""):
-            return data[key]
-    return None
+@app.after_request
+def _log_request(resp):
+    if request.path != "/health":
+        log.info(
+            "%s %s -> %s (%.0f ms)",
+            request.method,
+            request.full_path.rstrip("?"),
+            resp.status_code,
+            (time.time() - getattr(g, "t0", time.time())) * 1000,
+        )
+    return resp
 
 
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
 def parse_streaminfo(data):
     """Parse FLAC STREAMINFO from the first bytes of a FLAC file."""
     if len(data) < 26 or data[:4] != b"fLaC":
         return None, None
-
     block_type = data[4] & 0x7F
     block_length = int.from_bytes(data[5:8], "big")
     if block_type != 0 or block_length < 34:
@@ -139,29 +204,11 @@ def parse_streaminfo(data):
     packed = int.from_bytes(data[18:26], "big")
     sample_rate = packed >> 44
     bit_depth = ((packed >> 36) & 0x1F) + 1
-
     if not 1000 <= sample_rate <= 768000:
         sample_rate = None
     if not 4 <= bit_depth <= 32:
         bit_depth = None
     return sample_rate, bit_depth
-
-
-def flac_info(url):
-    """Read FLAC STREAMINFO from the first bytes without downloading the file."""
-    try:
-        response = SESSION.get(
-            url,
-            headers={"Range": "bytes=0-63"},
-            timeout=(5, 12),
-            stream=True,
-        )
-        response.raise_for_status()
-        data = response.raw.read(64)
-        response.close()
-        return parse_streaminfo(data)
-    except requests.RequestException:
-        return None, None
 
 
 def local_flac_info(path):
@@ -170,11 +217,6 @@ def local_flac_info(path):
             return parse_streaminfo(fh.read(64))
     except OSError:
         return None, None
-
-
-def quality(sr, bd):
-    # This addon only returns real FLAC, so its protocol tier is LOSSLESS.
-    return "LOSSLESS"
 
 
 def quality_label(sr, bd):
@@ -190,193 +232,15 @@ def quality_label(sr, bd):
 
 def base_url():
     configured = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
-    return configured or request.host_url.rstrip("/")
+    if configured:
+        return configured
+    # Behind Traefik/Dokploy the original scheme/host arrive in these headers
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    return f"{proto}://{host}"
 
 
-# --------------------------------------------------------------------------- #
-# Internet Archive (unchanged behaviour)
-# --------------------------------------------------------------------------- #
-def inspect(identifier, item):
-    name = str(item.get("name", ""))
-    url = (
-        f"https://archive.org/download/{quote(identifier, safe='')}/"
-        f"{quote(name, safe='')}"
-    )
-
-    sr = num(first(item, "sample_rate", "samplerate", "sampleRate"))
-    bd = num(first(item, "bit_depth", "bitdepth", "bitDepth"))
-
-    # Only probe the actual FLAC header when IA metadata does not already tell us.
-    if sr is None or bd is None:
-        detected_sr, detected_bd = flac_info(url)
-        sr = sr if sr is not None else detected_sr
-        bd = bd if bd is not None else detected_bd
-
-    return {
-        "url": url,
-        "filename": name,
-        "size": num(item.get("size")),
-        "length": num(item.get("length")),
-        "bitrate": num(first(item, "bitrate", "bit_rate", "bitRate")),
-        "sampleRate": sr,
-        "bitDepth": bd,
-        "quality": quality(sr, bd),
-    }
-
-
-def get_flac(identifier):
-    response = SESSION.get(
-        IA_METADATA.format(quote(identifier, safe="")),
-        timeout=(5, 20),
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    candidates = []
-    for item in data.get("files", []):
-        name = str(item.get("name", ""))
-        if not name.lower().endswith(".flac"):
-            continue
-        candidates.append((name, item))
-
-    if not candidates:
-        return None
-
-    # Prefer the largest FLAC first, then inspect the best few in parallel.
-    candidates.sort(key=lambda pair: num(pair[1].get("size")) or 0, reverse=True)
-    candidates = candidates[:12]
-
-    inspected = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(inspect, identifier, item) for _, item in candidates]
-        for future in as_completed(futures):
-            try:
-                inspected.append(future.result())
-            except Exception:
-                pass
-
-    if not inspected:
-        return None
-
-    inspected.sort(
-        key=lambda item: (
-            int((item.get("bitDepth") or 0) > 16),
-            item.get("bitDepth") or 0,
-            item.get("sampleRate") or 0,
-            item.get("size") or 0,
-        ),
-        reverse=True,
-    )
-    return inspected[0]
-
-
-def artist_hint(query, title, creator):
-    # IA metadata is inconsistent. Keep the real creator when available.
-    if isinstance(creator, list):
-        return str(creator[0]) if creator else "Internet Archive"
-    if creator:
-        return str(creator)
-    return "Internet Archive"
-
-
-def make_track(doc, flac):
-    identifier = str(doc["identifier"])
-    title = str(doc.get("title") or flac["filename"])
-    creator = doc.get("creator")
-    tier = flac.get("quality", "LOSSLESS")
-
-    return {
-        "id": identifier,
-        "title": title,
-        "artist": artist_hint("", title, creator),
-        "album": str(doc.get("album") or ""),
-        "duration": flac.get("length"),
-        "artworkURL": f"https://archive.org/services/img/{quote(identifier, safe='')}",
-        "format": "flac",
-        "audioQuality": tier,
-        "quality": quality_label(flac.get("sampleRate"), flac.get("bitDepth")),
-        "sampleRate": flac.get("sampleRate"),
-        "bitDepth": flac.get("bitDepth"),
-        "bitrate": flac.get("bitrate"),
-        "streamURL": flac["url"],
-    }
-
-
-def archive_search(query, limit):
-    try:
-        response = SESSION.get(
-            IA_SEARCH,
-            params={
-                "q": f"(mediatype:audio) AND ({query})",
-                "fl[]": ["identifier", "title", "creator", "album", "year"],
-                "rows": min(limit * 4, 80),
-                "page": 1,
-                "output": "json",
-            },
-            timeout=(5, 20),
-        )
-        response.raise_for_status()
-        docs = response.json().get("response", {}).get("docs", [])
-    except (requests.RequestException, ValueError):
-        return []
-
-    tracks = []
-    # Resolve several IA items concurrently so BitChord does not wait through
-    # a serial metadata request for every non-FLAC search hit.
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {}
-        for doc in docs:
-            identifier = doc.get("identifier")
-            if identifier:
-                futures[pool.submit(get_flac, str(identifier))] = doc
-
-        for future in as_completed(futures):
-            doc = futures[future]
-            try:
-                flac = future.result()
-            except Exception:
-                continue
-            if not flac:
-                continue
-
-            tracks.append(make_track(doc, flac))
-            if len(tracks) >= limit:
-                break
-    return tracks
-
-
-# --------------------------------------------------------------------------- #
-# Spotify: metadata, search, temporary download
-# --------------------------------------------------------------------------- #
-_sp_client = None
-_sp_client_failed = False
-
-
-def get_spotipy():
-    """Lazy spotipy client (client-credentials). Returns None if not configured."""
-    global _sp_client, _sp_client_failed
-    if _sp_client is not None or _sp_client_failed:
-        return _sp_client
-
-    cid = os.getenv("SPOTIFY_CLIENT_ID")
-    secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-    if not cid or not secret:
-        _sp_client_failed = True
-        return None
-    try:
-        import spotipy
-        from spotipy.oauth2 import SpotifyClientCredentials
-
-        _sp_client = spotipy.Spotify(
-            auth_manager=SpotifyClientCredentials(client_id=cid, client_secret=secret)
-        )
-    except Exception:
-        _sp_client_failed = True
-        _sp_client = None
-    return _sp_client
-
-
-def extract_spotify_id(text):
+def extract_spotify_id(text, allow_bare=False):
     text = (text or "").strip()
     for rx in (SPOTIFY_URL_RE, SPOTIFY_URI_RE):
         m = rx.search(text)
@@ -386,10 +250,72 @@ def extract_spotify_id(text):
         candidate = text[len(SPOTIFY_PREFIX):]
         if SPOTIFY_ID_RE.match(candidate):
             return candidate
+    if allow_bare and SPOTIFY_ID_RE.match(text):
+        return text
     return None
 
 
-def spotify_track_dict(track_id, title, artist, album, duration, art, stream_base):
+# --------------------------------------------------------------------------- #
+# Spotify metadata / search
+# --------------------------------------------------------------------------- #
+_sp_client = None
+_sp_error = None
+_sp_lock = threading.Lock()
+
+
+def get_spotipy():
+    """Lazy spotipy client (client-credentials). Returns None and sets _sp_error if unusable."""
+    global _sp_client, _sp_error
+    with _sp_lock:
+        if _sp_client is not None:
+            return _sp_client
+
+        cid = (os.getenv("SPOTIFY_CLIENT_ID") or "").strip()
+        secret = (os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip()
+        if not cid or not secret:
+            _sp_error = "SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET are not set"
+            return None
+
+        try:
+            import spotipy
+            from spotipy.oauth2 import SpotifyClientCredentials
+
+            kwargs = {"client_id": cid, "client_secret": secret}
+            try:
+                from spotipy.cache_handler import MemoryCacheHandler
+
+                kwargs["cache_handler"] = MemoryCacheHandler()
+            except Exception:
+                pass
+
+            _sp_client = spotipy.Spotify(
+                auth_manager=SpotifyClientCredentials(**kwargs),
+                requests_timeout=15,
+                retries=2,
+            )
+            _sp_error = None
+            log.info("spotipy client initialised")
+        except Exception as exc:
+            _sp_error = f"spotipy init failed: {exc!r}"
+            log.exception("spotipy init failed")
+            _sp_client = None
+        return _sp_client
+
+
+def _track_from_item(item, base):
+    images = (item.get("album") or {}).get("images") or []
+    return make_track(
+        track_id=item["id"],
+        title=item["name"],
+        artist=", ".join(a["name"] for a in item.get("artists", [])),
+        album=(item.get("album") or {}).get("name", ""),
+        duration=int((item.get("duration_ms") or 0) / 1000),
+        art=images[0]["url"] if images else "",
+        base=base,
+    )
+
+
+def make_track(track_id, title, artist, album, duration, art, base):
     return {
         "id": f"{SPOTIFY_PREFIX}{track_id}",
         "title": title,
@@ -403,96 +329,115 @@ def spotify_track_dict(track_id, title, artist, album, duration, art, stream_bas
         "sampleRate": None,
         "bitDepth": None,
         "bitrate": None,
-        # Lazy URL: the file is fetched from the lossless providers on first
-        # request and kept in the server's temp folder afterwards.
-        "streamURL": f"{stream_base}/file/{track_id}",
+        # Lazy URL: downloaded on first request, then served from the temp cache
+        "streamURL": f"{base}/file/{track_id}.flac",
     }
 
 
 def spotify_metadata(track_id):
-    """Return (title, artist, album, duration_sec, artwork_url). Spotipy first, SpotiFLAC second."""
+    """(title, artist, album, duration_sec, artwork_url) or None. Cached 24 h."""
+    cached = meta_cache.get(track_id)
+    if cached:
+        return cached
+
+    meta = None
     sp = get_spotipy()
     if sp is not None:
         try:
             info = sp.track(track_id)
             images = (info.get("album") or {}).get("images") or []
-            return (
+            meta = (
                 info["name"],
                 ", ".join(a["name"] for a in info.get("artists", [])),
                 (info.get("album") or {}).get("name", ""),
-                int(info.get("duration_ms", 0) / 1000),
+                int((info.get("duration_ms") or 0) / 1000),
                 images[0]["url"] if images else "",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("spotipy track(%s) failed: %r", track_id, exc)
 
-    try:
-        from SpotiFLAC import AsyncSpotiFLAC
+    if meta is None:
+        try:
+            from SpotiFLAC import AsyncSpotiFLAC
 
-        async def _meta():
-            async with AsyncSpotiFLAC(output_dir=CACHE_DIR) as client:
-                return await client.get_track_metadata(
-                    f"https://open.spotify.com/track/{track_id}"
-                )
+            async def _meta():
+                async with AsyncSpotiFLAC(output_dir=CACHE_DIR) as client:
+                    return await client.get_track_metadata(
+                        f"https://open.spotify.com/track/{track_id}"
+                    )
 
-        meta = asyncio.run(_meta())
-        return (
-            meta.title,
-            str(meta.artists),
-            "",
-            int(meta.duration_seconds or 0),
-            meta.cover_url or "",
-        )
-    except Exception:
-        return None
+            m = asyncio.run(_meta())
+            meta = (
+                m.title,
+                str(m.artists),
+                "",
+                int(m.duration_seconds or 0),
+                m.cover_url or "",
+            )
+        except Exception as exc:
+            log.warning("SpotiFLAC metadata(%s) failed: %r", track_id, exc)
+
+    if meta:
+        meta_cache.set(track_id, meta, 24 * 3600)
+    return meta
+
+
+class SearchError(Exception):
+    pass
 
 
 def spotify_search(query, limit):
     base = base_url()
 
-    # 1) Direct link / URI / sp:<id>
+    # 1) Link / URI / sp:<id>
     track_id = extract_spotify_id(query)
     if track_id:
         meta = spotify_metadata(track_id)
-        if meta:
-            title, artist, album, dur, art = meta
-        else:
-            title, artist, album, dur, art = track_id, "Spotify", "", None, ""
-        return [spotify_track_dict(track_id, title, artist, album, dur, art, base)]
+        title, artist, album, dur, art = meta or (track_id, "Spotify", "", None, "")
+        return [make_track(track_id, title, artist, album, dur, art, base)]
 
-    # 2) Text search (needs SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET)
+    # 2) Text search
     sp = get_spotipy()
     if sp is None:
-        return []
-    try:
-        items = sp.search(q=query, type="track", limit=min(limit, 50))["tracks"]["items"]
-    except Exception:
-        return []
+        raise SearchError(_sp_error or "Spotify search unavailable")
 
-    tracks = []
-    for item in items:
-        images = (item.get("album") or {}).get("images") or []
-        tracks.append(
-            spotify_track_dict(
-                item["id"],
-                item["name"],
-                ", ".join(a["name"] for a in item.get("artists", [])),
-                (item.get("album") or {}).get("name", ""),
-                int(item.get("duration_ms", 0) / 1000),
-                images[0]["url"] if images else "",
-                base,
-            )
-        )
+    cache_key = (query.lower(), limit)
+    cached = search_cache.get(cache_key)
+    if cached is not None:
+        log.info("search cache hit: %r", query)
+        return cached
+
+    tracks, offset = [], 0
+    try:
+        # Pages of 10: works even if the API caps `limit` for this app
+        while len(tracks) < limit:
+            page = min(10, limit - len(tracks))
+            items = sp.search(q=query, type="track", limit=page, offset=offset)[
+                "tracks"
+            ]["items"]
+            if not items:
+                break
+            tracks.extend(_track_from_item(i, base) for i in items if i and i.get("id"))
+            offset += page
+            if len(items) < page:
+                break
+    except Exception as exc:
+        log.error("spotipy search(%r) failed: %r", query, exc)
+        raise SearchError(f"Spotify search failed: {exc}") from exc
+
+    search_cache.set(cache_key, tracks, CACHE_SEARCH_TTL)
     return tracks
 
 
+# --------------------------------------------------------------------------- #
+# Audio cache (temporary server storage)
+# --------------------------------------------------------------------------- #
 def _find_audio(folder):
     best = None
     for root, _, files in os.walk(folder):
         for name in files:
             if name.lower().endswith(AUDIO_EXTS):
                 path = os.path.join(root, name)
-                # Prefer FLAC over other containers, then the biggest file
                 rank = (name.lower().endswith(".flac"), os.path.getsize(path))
                 if best is None or rank > best[0]:
                     best = (rank, path)
@@ -501,6 +446,82 @@ def _find_audio(folder):
 
 def _valid(path):
     return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 10000
+
+
+def _dir_size(folder):
+    total = 0
+    for root, _, files in os.walk(folder):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def cache_entries():
+    """[(mtime, size, track_id)] of completed cache folders."""
+    out = []
+    try:
+        names = os.listdir(CACHE_DIR)
+    except OSError:
+        return out
+    for name in names:
+        folder = os.path.join(CACHE_DIR, name)
+        if name.startswith(".") or not os.path.isdir(folder):
+            continue
+        try:
+            out.append((os.path.getmtime(folder), _dir_size(folder), name))
+        except OSError:
+            pass
+    return out
+
+
+def evict(protect=None):
+    """Delete expired tracks, then oldest tracks until under CACHE_MAX_BYTES."""
+    now = time.time()
+    entries = sorted(cache_entries())  # oldest first
+    kept = []
+    for mtime, size, name in entries:
+        if name == protect or _lock_for(name).locked():
+            kept.append((mtime, size, name))
+            continue
+        if now - mtime > CACHE_TTL:
+            shutil.rmtree(os.path.join(CACHE_DIR, name), ignore_errors=True)
+            log.info("cache: expired %s", name)
+        else:
+            kept.append((mtime, size, name))
+
+    total = sum(size for _, size, _ in kept)
+    for mtime, size, name in kept:
+        if total <= CACHE_MAX_BYTES:
+            break
+        if name == protect or _lock_for(name).locked():
+            continue
+        shutil.rmtree(os.path.join(CACHE_DIR, name), ignore_errors=True)
+        total -= size
+        log.info("cache: evicted %s (size limit)", name)
+
+
+def purge_on_start():
+    """Remove partial downloads / stale folders left by a previous run."""
+    try:
+        for name in os.listdir(CACHE_DIR):
+            folder = os.path.join(CACHE_DIR, name)
+            if name.startswith(".") and os.path.isdir(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+        evict()
+    except OSError:
+        pass
+
+
+def cleanup_loop():
+    while True:
+        time.sleep(300)
+        try:
+            evict()
+        except Exception:
+            log.exception("cache cleanup failed")
 
 
 async def _spotiflac_download(track_id, out_dir):
@@ -517,113 +538,125 @@ async def _spotiflac_download(track_id, out_dir):
         await client.download_track(f"https://open.spotify.com/track/{track_id}")
 
 
-def ensure_spotify_file(track_id):
-    """
-    Make sure the track is present in the temporary cache and return its path.
-    Raises RuntimeError if no lossless file could be fetched.
-    """
+def ensure_spotify_file(track_id, retry=False):
+    """Return the cached audio path, downloading it if needed. Raises RuntimeError."""
     if not SPOTIFY_ID_RE.match(track_id):
         raise RuntimeError("invalid Spotify track id")
 
-    track_dir = os.path.join(CACHE_DIR, track_id)
+    final_dir = os.path.join(CACHE_DIR, track_id)
 
     with _lock_for(track_id):  # one download per track at a time
-        existing = _find_audio(track_dir) if os.path.isdir(track_dir) else None
+        existing = _find_audio(final_dir) if os.path.isdir(final_dir) else None
         if _valid(existing):
-            os.utime(track_dir, None)  # keep it alive
+            os.utime(final_dir, None)  # refresh TTL
             return existing
 
-        shutil.rmtree(track_dir, ignore_errors=True)
-        os.makedirs(track_dir, exist_ok=True)
+        if retry:
+            failure_cache.delete(track_id)
+        else:
+            previous = failure_cache.get(track_id)
+            if previous:
+                raise RuntimeError(f"{previous} (cached failure, add ?retry=1 to retry)")
+
+        tmp_dir = os.path.join(CACHE_DIR, f".{track_id}.part-{os.getpid()}-{int(time.time())}")
+        os.makedirs(tmp_dir, exist_ok=True)
+        started = time.time()
+        log.info("download start: %s", track_id)
 
         try:
-            asyncio.run(_spotiflac_download(track_id, track_dir))
+            with _download_slots:  # limit parallel downloads
+                asyncio.run(
+                    asyncio.wait_for(_spotiflac_download(track_id, tmp_dir), DOWNLOAD_TIMEOUT)
+                )
+        except asyncio.TimeoutError:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            msg = f"download timed out after {DOWNLOAD_TIMEOUT}s"
+            failure_cache.set(track_id, msg, min(FAIL_TTL, 60))
+            log.error("download %s: %s", track_id, msg)
+            raise RuntimeError(msg)
         except Exception as exc:
-            shutil.rmtree(track_dir, ignore_errors=True)
-            raise RuntimeError(f"SpotiFLAC failed: {exc}") from exc
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            msg = f"SpotiFLAC failed: {exc}"
+            failure_cache.set(track_id, msg, FAIL_TTL)
+            log.exception("download %s failed", track_id)
+            raise RuntimeError(msg) from exc
 
-        path = _find_audio(track_dir)
+        path = _find_audio(tmp_dir)
         if not _valid(path):
-            shutil.rmtree(track_dir, ignore_errors=True)
-            raise RuntimeError("Lossless file not found on any provider")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            msg = "Lossless file not found on any provider"
+            failure_cache.set(track_id, msg, FAIL_TTL)
+            log.error("download %s: %s", track_id, msg)
+            raise RuntimeError(msg)
 
-        os.utime(track_dir, None)
-        return path
+        # Atomic publish: only complete downloads appear in the cache
+        shutil.rmtree(final_dir, ignore_errors=True)
+        os.replace(tmp_dir, final_dir)
+        os.utime(final_dir, None)
 
+        final_path = _find_audio(final_dir)
+        log.info(
+            "download done: %s %s (%.1f MB, %.1fs)",
+            track_id,
+            os.path.basename(final_path),
+            os.path.getsize(final_path) / 1048576,
+            time.time() - started,
+        )
 
-def cleanup_loop():
-    """Delete cached tracks that have not been used for CACHE_TTL seconds."""
-    while True:
-        time.sleep(300)
-        try:
-            now = time.time()
-            for name in os.listdir(CACHE_DIR):
-                folder = os.path.join(CACHE_DIR, name)
-                if not os.path.isdir(folder):
-                    continue
-                lock = _lock_for(name)
-                if lock.locked():  # download in progress
-                    continue
-                # Folder mtime is refreshed on every serve (see /file route)
-                if now - os.path.getmtime(folder) > CACHE_TTL:
-                    shutil.rmtree(folder, ignore_errors=True)
-        except Exception:
-            pass
+    evict(protect=track_id)
+    return final_path
 
 
+purge_on_start()
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
 
 # --------------------------------------------------------------------------- #
-# Endpoints logic
+# Endpoint logic
 # --------------------------------------------------------------------------- #
 def do_search():
     query = (request.args.get("q") or "").strip()
     if not query:
         return jsonify({"tracks": []})
 
-    # BitChord does not require a limit parameter; it trims the returned rows.
     try:
         limit = min(max(int(request.args.get("limit", "20")), 1), 30)
     except ValueError:
         limit = 20
 
-    source = (request.args.get("source") or "all").lower()
-    tracks = []
-
-    if source in ("all", "spotify"):
-        try:
-            tracks.extend(spotify_search(query, limit))
-        except Exception:
-            pass
-
-    # A pasted Spotify link should not also hit Internet Archive.
-    if source in ("all", "archive") and not extract_spotify_id(query):
-        remaining = max(limit - len(tracks), 0) if source == "all" else limit
-        if remaining:
-            try:
-                tracks.extend(archive_search(query, remaining))
-            except Exception as exc:
-                if not tracks:
-                    return jsonify({"tracks": [], "error": str(exc)}), 502
+    try:
+        tracks = spotify_search(query, limit)
+    except SearchError as exc:
+        return jsonify({"tracks": [], "error": str(exc)}), 502
+    except Exception as exc:
+        log.exception("search crashed")
+        return jsonify({"tracks": [], "error": str(exc)}), 500
 
     return jsonify({"tracks": tracks[:limit]})
 
 
-def do_stream_spotify(track_id):
+def do_stream(identifier):
+    identifier = (identifier or "").strip()
+    if not identifier:
+        return jsonify({"error": "missing id"}), 400
+
+    track_id = extract_spotify_id(identifier, allow_bare=True)
+    if not track_id:
+        return jsonify({"error": "not a Spotify track id"}), 400
+
     try:
-        path = ensure_spotify_file(track_id)
+        path = ensure_spotify_file(track_id, retry=request.args.get("retry") == "1")
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 404
 
     ext = os.path.splitext(path)[1].lower()
     is_flac = ext == ".flac"
     sr, bd = local_flac_info(path) if is_flac else (None, None)
-    label = quality_label(sr, bd) if is_flac else f"Lossless ({ext.lstrip('.').upper()})"
     fmt = "flac" if is_flac else ext.lstrip(".")
+    label = quality_label(sr, bd) if is_flac else f"Lossless ({fmt.upper()})"
 
     return jsonify({
-        "url": f"{base_url()}/file/{track_id}",
+        "url": f"{base_url()}/file/{track_id}{ext}",
         "format": fmt,
         "quality": label,
         "audioQuality": "LOSSLESS",
@@ -634,40 +667,6 @@ def do_stream_spotify(track_id):
         "sampleRate": sr,
         "bitDepth": bd,
         "bitrate": None,
-        "audioMode": "stereo",
-    })
-
-
-def do_stream(identifier):
-    identifier = (identifier or "").strip()
-    if not identifier:
-        return jsonify({"error": "missing id"}), 400
-
-    # Spotify items: "sp:<22-char id>" (also accepts a raw link)
-    spotify_id = extract_spotify_id(identifier)
-    if spotify_id:
-        return do_stream_spotify(spotify_id)
-
-    try:
-        flac = get_flac(identifier)
-    except requests.RequestException as exc:
-        return jsonify({"error": str(exc)}), 502
-
-    if not flac:
-        return jsonify({"error": "No FLAC file found for this item"}), 404
-
-    return jsonify({
-        "url": flac["url"],
-        "format": "flac",
-        "quality": quality_label(flac.get("sampleRate"), flac.get("bitDepth")),
-        "audioQuality": flac.get("quality", "LOSSLESS"),
-        "codec": "flac",
-        "container": "flac",
-        "manifest": "none",
-        "encrypted": False,
-        "sampleRate": flac.get("sampleRate"),
-        "bitDepth": flac.get("bitDepth"),
-        "bitrate": flac.get("bitrate"),
         "audioMode": "stereo",
     })
 
@@ -708,19 +707,18 @@ def stream_query():
 
 @app.get("/file/<track_id>")
 def serve_spotify_file(track_id):
-    """Serve the temporarily stored Spotify audio (downloads it on first hit)."""
-    track_id = track_id.split(".")[0]  # allow /file/<id>.flac
+    """Serve the temporarily stored audio (downloads it on first request)."""
+    track_id = track_id.split(".")[0]
     if not SPOTIFY_ID_RE.match(track_id):
         abort(404)
 
     try:
-        path = ensure_spotify_file(track_id)
+        path = ensure_spotify_file(track_id, retry=request.args.get("retry") == "1")
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 404
 
-    # Refresh the TTL while the track is being played
     try:
-        os.utime(os.path.dirname(path), None)
+        os.utime(os.path.dirname(path), None)  # keep alive while playing
     except OSError:
         pass
 
@@ -728,9 +726,62 @@ def serve_spotify_file(track_id):
     return send_file(
         path,
         mimetype=MIME_TYPES.get(ext, "application/octet-stream"),
-        conditional=True,  # enables Range requests / seeking
+        conditional=True,  # Range requests / seeking
         max_age=0,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Debug endpoints (no secrets are exposed)
+# --------------------------------------------------------------------------- #
+@app.get("/debug/spotify")
+def debug_spotify():
+    if not DEBUG_ENDPOINTS:
+        abort(404)
+
+    info = {
+        "client_id_set": bool(os.getenv("SPOTIFY_CLIENT_ID")),
+        "client_secret_set": bool(os.getenv("SPOTIFY_CLIENT_SECRET")),
+        "public_url": os.getenv("PUBLIC_URL") or None,
+    }
+    for mod in ("spotipy", "SpotiFLAC"):
+        try:
+            __import__(mod)
+            info[f"{mod}_import"] = "ok"
+        except Exception as exc:
+            info[f"{mod}_import"] = f"FAILED: {exc!r}"
+
+    sp = get_spotipy()
+    info["spotipy_client"] = "ok" if sp else f"unavailable: {_sp_error}"
+    if sp:
+        try:
+            res = sp.search(q="blinding lights", type="track", limit=5)
+            info["test_search"] = f"ok, {len(res['tracks']['items'])} results"
+        except Exception as exc:
+            info["test_search"] = f"FAILED: {exc!r}"
+    return jsonify(info)
+
+
+@app.get("/debug/cache")
+def debug_cache():
+    if not DEBUG_ENDPOINTS:
+        abort(404)
+    now = time.time()
+    entries = cache_entries()
+    return jsonify({
+        "dir": CACHE_DIR,
+        "ttl_seconds": CACHE_TTL,
+        "max_mb": CACHE_MAX_BYTES // (1024 * 1024),
+        "total_mb": round(sum(s for _, s, _ in entries) / 1048576, 2),
+        "tracks": [
+            {
+                "id": name,
+                "size_mb": round(size / 1048576, 2),
+                "idle_seconds": int(now - mtime),
+            }
+            for mtime, size, name in sorted(entries, reverse=True)
+        ],
+    })
 
 
 if __name__ == "__main__":
