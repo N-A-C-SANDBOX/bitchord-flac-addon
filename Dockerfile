@@ -17,7 +17,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY layz_addon.py .
+COPY server.py .
 
 # Run as a non-root user; give it ownership of the temp download folder
 RUN useradd -m appuser \
