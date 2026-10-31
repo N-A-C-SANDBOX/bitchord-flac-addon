@@ -75,12 +75,10 @@ MIME_TYPES = {
     ".mp3": "audio/mpeg",
 }
 
-# Official Mornye registry (web/JS extensions with built-in session handling).
-# Override with MORNYE_REGISTRIES to use e.g. the PY-Audio Python providers
-# (those need working upstream API endpoints configured separately).
-DEFAULT_REGISTRY = (
-    "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/registry.json"
-)
+# Official Mornye registry (web/JS download providers) + PY-Audio registry
+# (provides the required utilities.sflx core helper and optional *-py providers).
+# Override entirely with MORNYE_REGISTRIES if needed.
+DEFAULT_REGISTRY = "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/registry.json,https://raw.githubusercontent.com/moto-costiera/PY-Audio/main/registry.json"
 
 
 def _int_env(name, default):
@@ -253,6 +251,9 @@ def bootstrap_mornye_extensions():
             ext_id = svc[4:] if svc.startswith("ext:") else svc
             if ext_id and ext_id not in wanted:
                 wanted.append(ext_id)
+        # Always try to install utilities first — core metadata helpers need it.
+        install_order = ["utilities"] + [e for e in wanted if e != "utilities"]
+
         for reg_url in MORNYE_REGISTRIES:
             try:
                 reg_data = _http_get(reg_url, timeout=12, as_json=True)
@@ -270,7 +271,7 @@ def bootstrap_mornye_extensions():
                 log.warning("Could not fetch registry %s: %r", reg_url, exc)
                 available_ids = {}
 
-            for ext_id in wanted:
+            for ext_id in install_order:
                 if ext_id in installed:
                     continue
                 if available_ids and ext_id not in available_ids:
@@ -279,14 +280,45 @@ def bootstrap_mornye_extensions():
                     log.info("Installing Mornye extension %r from %s...", ext_id, reg_url)
                     em.install(ext_id, registry_url=reg_url)
                     installed.add(ext_id)
+                    log.info("Installed Mornye extension %r", ext_id)
                 except Exception as exc:
-                    log.debug("Extension %r install skipped: %r", ext_id, exc)
+                    log.warning("Extension %r install failed from %s: %r", ext_id, reg_url, exc)
+
+        if "utilities" not in installed:
+            log.error(
+                "CRITICAL: utilities extension is not installed. "
+                "Downloads will fail until it is available from a registry."
+            )
     except Exception as exc:
         log.warning("Mornye extension bootstrap warning: %r", exc)
 
 
 # Run extension bootstrap in background thread so gunicorn starts immediately
 threading.Thread(target=bootstrap_mornye_extensions, daemon=True).start()
+
+_utilities_ready = threading.Event()
+
+
+def ensure_utilities_extension():
+    """Block until utilities is installed (or we have already tried)."""
+    if _utilities_ready.is_set():
+        return
+    try:
+        from mornye.extensions import ExtensionManager
+
+        em = ExtensionManager()
+        # Best-effort: install utilities from any configured registry
+        for reg_url in MORNYE_REGISTRIES:
+            try:
+                em.install("utilities", registry_url=reg_url)
+                log.info("ensure_utilities: installed from %s", reg_url)
+                break
+            except Exception as exc:
+                log.debug("ensure_utilities via %s: %r", reg_url, exc)
+    except Exception as exc:
+        log.warning("ensure_utilities_extension failed: %r", exc)
+    finally:
+        _utilities_ready.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -733,6 +765,8 @@ def cleanup_loop():
 async def _mornye_download(source_url, out_dir):
     from mornye import AsyncMornye
 
+    # Core metadata helpers require utilities.sflx — install if missing.
+    ensure_utilities_extension()
     os.environ["MORNYE_PROGRESS_BARS"] = "0"
     # Note: current AsyncMornye does not accept use_extensions_fallback
     # (docs mention it, but the client constructor does not). Fallback
