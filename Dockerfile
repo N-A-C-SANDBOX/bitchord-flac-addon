@@ -32,4 +32,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 # One process (download locks + cleanup thread live in-process), many threads,
 # long timeout so slow lossless downloads are not killed.
-CMD ["sh", "-c", "exec gunicorn -w 1 --threads 8 --timeout 180 -b 0.0.0.0:${PORT} layz_addon:app"]
+CMD ["sh", "-c", "exec gunicorn -w 1 --threads 8 --timeout 180 -b 0.0.0.0:${PORT} server:app"]
