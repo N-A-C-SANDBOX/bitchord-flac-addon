@@ -76,7 +76,7 @@ MIME_TYPES = {
 }
 
 DEFAULT_REGISTRY = (
-    "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/registry.json"
+    "https://raw.githubusercontent.com/moto-costiera/PY-Audio/main/registry.json"
 )
 
 
@@ -108,7 +108,7 @@ _raw_services = os.getenv(
     "MORNYE_SERVICES",
     os.getenv(
         "SPOTIFY_SERVICES",
-        "ext:qobuz-web,ext:tidal-web,ext:deezer,ext:amazon",
+        "ext:qobuz-py,ext:tidal-py,ext:deezer-py,ext:amazon-py",
     ),
 )
 MORNYE_SERVICES = [s.strip() for s in _raw_services.split(",") if s.strip()]
@@ -195,37 +195,48 @@ def _http_get(url, headers=None, timeout=10, as_json=True):
 # --------------------------------------------------------------------------- #
 def bootstrap_mornye_extensions():
     """
-    Ensure required extensions (utilities, spotify-web, qobuz-web, tidal-web,
-    deezer, amazon) are installed in Mornye's extension directory.
+    Ensure required extensions (utilities + Python native download providers)
+    are installed in Mornye's extension directory from the configured registries.
     """
     try:
         from mornye.extensions import ExtensionManager
 
         em = ExtensionManager()
         installed = set()
-        for method in ("list_installed", "installed_ids", "get_installed"):
+        for method in ("list_installed", "installed_ids"):
             fn = getattr(em, method, None)
-            if callable(fn):
+            if not callable(fn):
+                continue
+            try:
                 res = fn()
-                if isinstance(res, dict):
-                    installed.update(res.keys())
-                elif isinstance(res, (list, tuple, set)):
-                    for item in res:
+            except TypeError:
+                # Some versions require an argument; skip and try next method
+                continue
+            if isinstance(res, dict):
+                installed.update(k for k in res.keys() if k)
+            elif isinstance(res, (list, tuple, set)):
+                for item in res:
+                    if isinstance(item, str) and item:
+                        installed.add(item)
+                    elif isinstance(item, dict):
+                        installed.add(item.get("id") or item.get("name") or "")
+                    else:
                         installed.add(
-                            item
-                            if isinstance(item, str)
-                            else getattr(item, "id", None)
+                            getattr(item, "id", None)
                             or getattr(item, "name", None)
-                            or (item.get("id") if isinstance(item, dict) else "")
+                            or ""
                         )
+            installed.discard("")
 
+        # Prefer the Python-native providers from the PY-Audio registry
         wanted = [
             "utilities",
-            "spotify-web",
-            "qobuz-web",
-            "tidal-web",
-            "deezer",
-            "amazon",
+            "qobuz-py",
+            "tidal-py",
+            "deezer-py",
+            "amazon-py",
+            "soundcloud-py",
+            "youtube-py",
         ]
         for reg_url in MORNYE_REGISTRIES:
             try:
@@ -664,13 +675,15 @@ async def _mornye_download(track_id, out_dir):
     from mornye import AsyncMornye
 
     os.environ["MORNYE_PROGRESS_BARS"] = "0"
+    # Note: current AsyncMornye does not accept use_extensions_fallback
+    # (docs mention it, but the client constructor does not). Fallback
+    # across the listed services is still the default behaviour.
     async with AsyncMornye(
         output_dir=out_dir,
         services=MORNYE_SERVICES,
         registries=MORNYE_REGISTRIES,
         quality="LOSSLESS",
         allow_fallback=True,
-        use_extensions_fallback=True,
     ) as client:
         await client.download_track(f"https://open.spotify.com/track/{track_id}")
 
