@@ -7,9 +7,18 @@ ENV PYTHONUNBUFFERED=1 \
     CACHE_DIR=/tmp/layz_spotify \
     CACHE_TTL=3600
 
-# ffmpeg is used by SpotiFLAC for tagging/conversion; ca-certificates for HTTPS
+# ffmpeg: tagging/conversion
+# ca-certificates: HTTPS
+# nodejs: required by Mornye web/JS extensions (qobuz-web, tidal-web, deezer, amazon, …)
+# Must be installed as root at build time — the runtime user cannot apt-get.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        ca-certificates \
+        nodejs \
+        npm \
+    && node --version \
+    && npm --version \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
