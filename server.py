@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
 """
-Layz Add On – Spotify lossless (FLAC) add-on for BitChord
+Layz Add On – Lossless (FLAC) add-on for BitChord (Powered by Mornye-Python)
 
-* Search by song name (spotipy) or by pasted Spotify link / URI / sp:<id>
-* Audio is fetched with SpotiFLAC into a temporary server cache and streamed
-  through /file/<track_id> (HTTP Range supported, so seeking works)
-
-Caching
--------
-* Search results  : in-memory, CACHE_SEARCH_TTL seconds
-* Track metadata  : in-memory, 24 h
-* Audio files     : CACHE_DIR, deleted CACHE_TTL seconds after last use
-                    and trimmed (oldest first) when CACHE_MAX_MB is exceeded
-* Downloads are written to a hidden ".part" folder and moved into place only
-  when complete, so half-downloaded files are never served
-* One download per track at a time, MAX_DOWNLOADS in parallel overall
-* Failed downloads are remembered for FAIL_TTL seconds (no hammering providers)
-* Leftovers from a previous run are purged on start-up
+* Search directly by song name (keyless Spotify / Mornye / Deezer fallback) or by
+  pasted Spotify link / URI / sp:<id> — no spotipy or Spotify API keys required!
+* Audio is fetched with Mornye (AsyncMornye) into a temporary server cache and
+  streamed through /file/<track_id> (HTTP Range supported, so seeking works)
 
 Environment variables
 ---------------------
 PORT                   default 8080
 PUBLIC_URL             public https base URL (e.g. https://addon.example.com)
-SPOTIFY_CLIENT_ID      required for searching by name
-SPOTIFY_CLIENT_SECRET  required for searching by name
-SPOTIFY_SERVICES       default deezer,qobuz,amazon,tidal
-CACHE_DIR              default <tmp>/layz_spotify
+MORNYE_REGISTRIES      extension registry JSON URL(s)
+                       default: https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/registry.json
+MORNYE_SERVICES        default ext:deezer-web,ext:qobuz-web,ext:tidal-web,ext:amazon-web,deezer,qobuz,amazon,tidal
+CACHE_DIR              default <tmp>/layz_mornye
 CACHE_TTL              default 3600   (seconds an unused track stays on disk)
 CACHE_MAX_MB           default 2048   (max total size of the audio cache)
 CACHE_SEARCH_TTL       default 600
@@ -35,6 +24,7 @@ FAIL_TTL               default 300
 DEBUG_ENDPOINTS        default 1      (set 0 to disable /debug/*)
 """
 import asyncio
+import json
 import logging
 import os
 import re
@@ -42,6 +32,8 @@ import shutil
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 from flask import Flask, abort, g, jsonify, request, send_file
 
@@ -59,8 +51,8 @@ app = Flask(__name__)
 
 MANIFEST = {
     "id": "bitchord-internet-archive-flac",
-    "name": "Layz Add On",
-    "version": "2.0.0",
+    "name": "Layz Add On (Mornye)",
+    "version": "3.0.0",
     "resources": ["search", "stream"],
     "settings": [
         {
@@ -94,6 +86,10 @@ MIME_TYPES = {
     ".mp3": "audio/mpeg",
 }
 
+DEFAULT_REGISTRY = (
+    "https://raw.githubusercontent.com/mornyeapp/Mornye-Extension/main/registry.json"
+)
+
 
 def _int_env(name, default):
     try:
@@ -102,7 +98,9 @@ def _int_env(name, default):
         return default
 
 
-CACHE_DIR = os.getenv("CACHE_DIR") or os.path.join(tempfile.gettempdir(), "layz_spotify")
+CACHE_DIR = os.getenv("CACHE_DIR") or os.path.join(
+    tempfile.gettempdir(), "layz_mornye"
+)
 CACHE_TTL = _int_env("CACHE_TTL", 3600)
 CACHE_MAX_BYTES = _int_env("CACHE_MAX_MB", 2048) * 1024 * 1024
 CACHE_SEARCH_TTL = _int_env("CACHE_SEARCH_TTL", 600)
@@ -110,12 +108,22 @@ MAX_DOWNLOADS = max(_int_env("MAX_DOWNLOADS", 2), 1)
 DOWNLOAD_TIMEOUT = _int_env("DOWNLOAD_TIMEOUT", 150)
 FAIL_TTL = _int_env("FAIL_TTL", 300)
 DEBUG_ENDPOINTS = os.getenv("DEBUG_ENDPOINTS", "1") == "1"
-SPOTIFY_SERVICES = [
-    s.strip()
-    for s in os.getenv("SPOTIFY_SERVICES", "deezer,qobuz,amazon,tidal").split(",")
-    if s.strip()
-]
 
+# Support both MORNYE_SERVICES and legacy SPOTIFY_SERVICES
+_raw_services = os.getenv(
+    "MORNYE_SERVICES",
+    os.getenv(
+        "SPOTIFY_SERVICES",
+        "ext:deezer-web,ext:qobuz-web,ext:tidal-web,ext:amazon-web,deezer,qobuz,amazon,tidal",
+    ),
+)
+MORNYE_SERVICES = [s.strip() for s in _raw_services.split(",") if s.strip()]
+
+_raw_registries = os.getenv("MORNYE_REGISTRIES", DEFAULT_REGISTRY)
+MORNYE_REGISTRIES = [r.strip() for r in _raw_registries.split(",") if r.strip()]
+
+os.environ.setdefault("MORNYE_REGISTRIES", ",".join(MORNYE_REGISTRIES))
+os.environ["MORNYE_PROGRESS_BARS"] = "0"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
@@ -157,6 +165,7 @@ class TTLCache:
 search_cache = TTLCache()
 meta_cache = TTLCache()
 failure_cache = TTLCache()
+token_cache = TTLCache(maxsize=5)
 
 _locks_guard = threading.Lock()
 _track_locks = {}
@@ -234,7 +243,6 @@ def base_url():
     configured = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
     if configured:
         return configured
-    # Behind Traefik/Dokploy the original scheme/host arrive in these headers
     proto = request.headers.get("X-Forwarded-Proto", request.scheme)
     host = request.headers.get("X-Forwarded-Host", request.host)
     return f"{proto}://{host}"
@@ -247,72 +255,12 @@ def extract_spotify_id(text, allow_bare=False):
         if m:
             return m.group(1)
     if text.lower().startswith(SPOTIFY_PREFIX):
-        candidate = text[len(SPOTIFY_PREFIX):]
+        candidate = text[len(SPOTIFY_PREFIX) :]
         if SPOTIFY_ID_RE.match(candidate):
             return candidate
     if allow_bare and SPOTIFY_ID_RE.match(text):
         return text
     return None
-
-
-# --------------------------------------------------------------------------- #
-# Spotify metadata / search
-# --------------------------------------------------------------------------- #
-_sp_client = None
-_sp_error = None
-_sp_lock = threading.Lock()
-
-
-def get_spotipy():
-    """Lazy spotipy client (client-credentials). Returns None and sets _sp_error if unusable."""
-    global _sp_client, _sp_error
-    with _sp_lock:
-        if _sp_client is not None:
-            return _sp_client
-
-        cid = (os.getenv("SPOTIFY_CLIENT_ID") or "").strip()
-        secret = (os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip()
-        if not cid or not secret:
-            _sp_error = "SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET are not set"
-            return None
-
-        try:
-            import spotipy
-            from spotipy.oauth2 import SpotifyClientCredentials
-
-            kwargs = {"client_id": cid, "client_secret": secret}
-            try:
-                from spotipy.cache_handler import MemoryCacheHandler
-
-                kwargs["cache_handler"] = MemoryCacheHandler()
-            except Exception:
-                pass
-
-            _sp_client = spotipy.Spotify(
-                auth_manager=SpotifyClientCredentials(**kwargs),
-                requests_timeout=15,
-                retries=2,
-            )
-            _sp_error = None
-            log.info("spotipy client initialised")
-        except Exception as exc:
-            _sp_error = f"spotipy init failed: {exc!r}"
-            log.exception("spotipy init failed")
-            _sp_client = None
-        return _sp_client
-
-
-def _track_from_item(item, base):
-    images = (item.get("album") or {}).get("images") or []
-    return make_track(
-        track_id=item["id"],
-        title=item["name"],
-        artist=", ".join(a["name"] for a in item.get("artists", [])),
-        album=(item.get("album") or {}).get("name", ""),
-        duration=int((item.get("duration_ms") or 0) / 1000),
-        art=images[0]["url"] if images else "",
-        base=base,
-    )
 
 
 def make_track(track_id, title, artist, album, duration, art, base):
@@ -329,53 +277,97 @@ def make_track(track_id, title, artist, album, duration, art, base):
         "sampleRate": None,
         "bitDepth": None,
         "bitrate": None,
-        # Lazy URL: downloaded on first request, then served from the temp cache
         "streamURL": f"{base}/file/{track_id}.flac",
     }
 
 
+def _http_get_json(url, headers=None, timeout=10):
+    req_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+    }
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, headers=req_headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+# --------------------------------------------------------------------------- #
+# Direct Metadata & Search (No Spotipy Required)
+# --------------------------------------------------------------------------- #
+def _get_anon_spotify_token():
+    """Fetch an anonymous Spotify web player token without Client ID/Secret."""
+    cached = token_cache.get("anon_token")
+    if cached:
+        return cached
+    try:
+        data = _http_get_json(
+            "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
+        )
+        token = data.get("accessToken")
+        expires_ms = data.get("accessTokenExpirationTimestampMs", 0)
+        if token:
+            ttl = max(int((expires_ms / 1000) - time.time()) - 30, 60)
+            token_cache.set("anon_token", token, ttl)
+            return token
+    except Exception as exc:
+        log.debug("Anonymous Spotify token fetch failed: %r", exc)
+    return None
+
+
 def spotify_metadata(track_id):
-    """(title, artist, album, duration_sec, artwork_url) or None. Cached 24 h."""
+    """Fetch (title, artist, album, duration_sec, artwork_url) via Mornye."""
     cached = meta_cache.get(track_id)
     if cached:
         return cached
 
     meta = None
-    sp = get_spotipy()
-    if sp is not None:
-        try:
-            info = sp.track(track_id)
-            images = (info.get("album") or {}).get("images") or []
-            meta = (
-                info["name"],
-                ", ".join(a["name"] for a in info.get("artists", [])),
-                (info.get("album") or {}).get("name", ""),
-                int((info.get("duration_ms") or 0) / 1000),
-                images[0]["url"] if images else "",
-            )
-        except Exception as exc:
-            log.warning("spotipy track(%s) failed: %r", track_id, exc)
+    try:
+        from mornye import AsyncMornye
 
+        async def _meta():
+            async with AsyncMornye(
+                output_dir=CACHE_DIR, registries=MORNYE_REGISTRIES
+            ) as client:
+                return await client.get_track_metadata(
+                    f"https://open.spotify.com/track/{track_id}"
+                )
+
+        m = asyncio.run(_meta())
+        artists = (
+            ", ".join(m.artists)
+            if isinstance(getattr(m, "artists", None), (list, tuple))
+            else str(getattr(m, "artists", ""))
+        )
+        meta = (
+            getattr(m, "title", track_id),
+            artists,
+            getattr(m, "album", "") or "",
+            int(getattr(m, "duration_seconds", 0) or 0),
+            getattr(m, "cover_url", "") or "",
+        )
+    except Exception as exc:
+        log.warning("Mornye metadata(%s) failed: %r", track_id, exc)
+
+    # Fallback to Spotify oEmbed if Mornye metadata call fails
     if meta is None:
         try:
-            from SpotiFLAC import AsyncSpotiFLAC
-
-            async def _meta():
-                async with AsyncSpotiFLAC(output_dir=CACHE_DIR) as client:
-                    return await client.get_track_metadata(
-                        f"https://open.spotify.com/track/{track_id}"
-                    )
-
-            m = asyncio.run(_meta())
+            oembed = _http_get_json(
+                f"https://open.spotify.com/oembed?url=https://open.spotify.com/track/{track_id}"
+            )
             meta = (
-                m.title,
-                str(m.artists),
+                oembed.get("title", track_id),
+                oembed.get("author_name", "Spotify"),
                 "",
-                int(m.duration_seconds or 0),
-                m.cover_url or "",
+                0,
+                oembed.get("thumbnail_url", ""),
             )
         except Exception as exc:
-            log.warning("SpotiFLAC metadata(%s) failed: %r", track_id, exc)
+            log.warning("Spotify oembed(%s) failed: %r", track_id, exc)
 
     if meta:
         meta_cache.set(track_id, meta, 24 * 3600)
@@ -386,51 +378,197 @@ class SearchError(Exception):
     pass
 
 
-def spotify_search(query, limit):
+async def _mornye_direct_search(query, limit, base):
+    """
+    Attempt search using Mornye's native search methods or its built-in
+    csv_source catalogue resolver (no Spotify API keys needed).
+    """
+    from mornye import AsyncMornye
+
+    async with AsyncMornye(
+        output_dir=CACHE_DIR,
+        services=MORNYE_SERVICES,
+        registries=MORNYE_REGISTRIES,
+    ) as client:
+        for method_name in ("search", "search_tracks"):
+            fn = getattr(client, method_name, None)
+            if callable(fn):
+                res = await fn(query, limit=limit)
+                items = res.get("tracks", res) if isinstance(res, dict) else res
+                tracks = []
+                for item in items or []:
+                    tid = extract_spotify_id(
+                        str(
+                            getattr(item, "url", None)
+                            or getattr(item, "id", None)
+                            or (item.get("id") if isinstance(item, dict) else "")
+                        ),
+                        allow_bare=True,
+                    )
+                    if not tid:
+                        continue
+                    title = getattr(item, "title", None) or (
+                        item.get("title") or item.get("name")
+                        if isinstance(item, dict)
+                        else ""
+                    )
+                    artist = getattr(item, "artists", None) or (
+                        item.get("artist") if isinstance(item, dict) else ""
+                    )
+                    if isinstance(artist, (list, tuple)):
+                        artist = ", ".join(str(a) for a in artist)
+                    album = getattr(item, "album", None) or (
+                        item.get("album", "") if isinstance(item, dict) else ""
+                    )
+                    dur = int(
+                        getattr(item, "duration_seconds", 0)
+                        or (item.get("duration", 0) if isinstance(item, dict) else 0)
+                        or 0
+                    )
+                    art = getattr(item, "cover_url", None) or (
+                        item.get("cover_url", "") if isinstance(item, dict) else ""
+                    )
+                    tracks.append(
+                        make_track(tid, title, str(artist), album, dur, art, base)
+                    )
+                if tracks:
+                    return tracks[:limit]
+    return None
+
+
+def _anon_spotify_search(query, limit, base):
+    """Search directly via anonymous Spotify web token (no spotipy required)."""
+    token = _get_anon_spotify_token()
+    if not token:
+        return None
+    params = urllib.parse.urlencode({"q": query, "type": "track", "limit": limit})
+    data = _http_get_json(
+        f"https://api.spotify.com/v1/search?{params}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    items = (data.get("tracks") or {}).get("items") or []
+    tracks = []
+    for item in items:
+        if not item or not item.get("id"):
+            continue
+        images = (item.get("album") or {}).get("images") or []
+        tracks.append(
+            make_track(
+                track_id=item["id"],
+                title=item["name"],
+                artist=", ".join(a["name"] for a in item.get("artists", [])),
+                album=(item.get("album") or {}).get("name", ""),
+                duration=int((item.get("duration_ms") or 0) / 1000),
+                art=images[0]["url"] if images else "",
+                base=base,
+            )
+        )
+    return tracks
+
+
+def _csv_catalogue_fallback_search(query, limit, base):
+    """
+    Fallback: Query public Deezer search API for candidate tracks and resolve
+    their Spotify track IDs via Mornye's built-in csv_source catalogue matcher.
+    """
+    from mornye.core import csv_source
+
+    params = urllib.parse.urlencode({"q": query, "limit": min(limit, 10)})
+    dz_data = _http_get_json(f"https://api.deezer.com/search?{params}")
+    dz_items = dz_data.get("data") or []
+    if not dz_items:
+        return []
+
+    # Build an in-memory CSV with Title, Artist, Album, Duration to feed Mornye's matcher
+    lines = ["Track Name,Artist Name(s),Album Name,Duration (ms)"]
+    for item in dz_items:
+        t = (item.get("title") or "").replace('"', '""')
+        a = ((item.get("artist") or {}).get("name") or "").replace('"', '""')
+        alb = ((item.get("album") or {}).get("title") or "").replace('"', '""')
+        dur_ms = int(item.get("duration") or 0) * 1000
+        lines.append(f'"{t}","{a}","{alb}","{dur_ms}"')
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".csv", delete=False, encoding="utf-8"
+    ) as tmp:
+        tmp.write("\n".join(lines))
+        tmp_path = tmp.name
+
+    try:
+        doc = csv_source.read_rows(tmp_path)
+        resolution = asyncio.run(csv_source.resolve_rows(doc.rows, document=doc))
+        tracks = []
+        for idx, url in enumerate(getattr(resolution, "urls", []) or []):
+            tid = extract_spotify_id(url, allow_bare=True)
+            if not tid:
+                continue
+            src = dz_items[idx] if idx < len(dz_items) else {}
+            tracks.append(
+                make_track(
+                    track_id=tid,
+                    title=src.get("title") or tid,
+                    artist=(src.get("artist") or {}).get("name") or "",
+                    album=(src.get("album") or {}).get("title") or "",
+                    duration=int(src.get("duration") or 0),
+                    art=(src.get("album") or {}).get("cover_xl") or "",
+                    base=base,
+                )
+            )
+        return tracks
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def direct_search(query, limit):
     base = base_url()
 
-    # 1) Link / URI / sp:<id>
+    # 1) Pasted Spotify Link / URI / sp:<id>
     track_id = extract_spotify_id(query)
     if track_id:
         meta = spotify_metadata(track_id)
         title, artist, album, dur, art = meta or (track_id, "Spotify", "", None, "")
         return [make_track(track_id, title, artist, album, dur, art, base)]
 
-    # 2) Text search
-    sp = get_spotipy()
-    if sp is None:
-        raise SearchError(_sp_error or "Spotify search unavailable")
-
+    # 2) Direct text search (cached)
     cache_key = (query.lower(), limit)
     cached = search_cache.get(cache_key)
     if cached is not None:
         log.info("search cache hit: %r", query)
         return cached
 
-    tracks, offset = [], 0
-    try:
-        # Pages of 10: works even if the API caps `limit` for this app
-        while len(tracks) < limit:
-            page = min(10, limit - len(tracks))
-            items = sp.search(q=query, type="track", limit=page, offset=offset)[
-                "tracks"
-            ]["items"]
-            if not items:
-                break
-            tracks.extend(_track_from_item(i, base) for i in items if i and i.get("id"))
-            offset += page
-            if len(items) < page:
-                break
-    except Exception as exc:
-        log.error("spotipy search(%r) failed: %r", query, exc)
-        raise SearchError(f"Spotify search failed: {exc}") from exc
+    tracks = None
 
+    # Tier A: Mornye native search
+    try:
+        tracks = asyncio.run(_mornye_direct_search(query, limit, base))
+    except Exception as exc:
+        log.debug("Mornye native search skipped: %r", exc)
+
+    # Tier B: Keyless Spotify Web API search
+    if not tracks:
+        try:
+            tracks = _anon_spotify_search(query, limit, base)
+        except Exception as exc:
+            log.warning("Keyless Spotify search failed: %r", exc)
+
+    # Tier C: Public Deezer + Mornye CSV resolver
+    if not tracks:
+        try:
+            tracks = _csv_catalogue_fallback_search(query, limit, base)
+        except Exception as exc:
+            log.error("Fallback catalogue search failed: %r", exc)
+            raise SearchError(f"Direct search failed: {exc}") from exc
+
+    tracks = tracks or []
     search_cache.set(cache_key, tracks, CACHE_SEARCH_TTL)
     return tracks
 
 
 # --------------------------------------------------------------------------- #
-# Audio cache (temporary server storage)
+# Audio cache & Mornye Downloader
 # --------------------------------------------------------------------------- #
 def _find_audio(folder):
     best = None
@@ -480,7 +618,7 @@ def cache_entries():
 def evict(protect=None):
     """Delete expired tracks, then oldest tracks until under CACHE_MAX_BYTES."""
     now = time.time()
-    entries = sorted(cache_entries())  # oldest first
+    entries = sorted(cache_entries())
     kept = []
     for mtime, size, name in entries:
         if name == protect or _lock_for(name).locked():
@@ -524,13 +662,14 @@ def cleanup_loop():
             log.exception("cache cleanup failed")
 
 
-async def _spotiflac_download(track_id, out_dir):
-    from SpotiFLAC import AsyncSpotiFLAC
+async def _mornye_download(track_id, out_dir):
+    from mornye import AsyncMornye
 
-    os.environ["SPOTIFLAC_PROGRESS_BARS"] = "0"
-    async with AsyncSpotiFLAC(
+    os.environ["MORNYE_PROGRESS_BARS"] = "0"
+    async with AsyncMornye(
         output_dir=out_dir,
-        services=SPOTIFY_SERVICES,
+        services=MORNYE_SERVICES,
+        registries=MORNYE_REGISTRIES,
         quality="LOSSLESS",
         allow_fallback=True,
         use_extensions_fallback=True,
@@ -545,10 +684,10 @@ def ensure_spotify_file(track_id, retry=False):
 
     final_dir = os.path.join(CACHE_DIR, track_id)
 
-    with _lock_for(track_id):  # one download per track at a time
+    with _lock_for(track_id):
         existing = _find_audio(final_dir) if os.path.isdir(final_dir) else None
         if _valid(existing):
-            os.utime(final_dir, None)  # refresh TTL
+            os.utime(final_dir, None)
             return existing
 
         if retry:
@@ -558,15 +697,19 @@ def ensure_spotify_file(track_id, retry=False):
             if previous:
                 raise RuntimeError(f"{previous} (cached failure, add ?retry=1 to retry)")
 
-        tmp_dir = os.path.join(CACHE_DIR, f".{track_id}.part-{os.getpid()}-{int(time.time())}")
+        tmp_dir = os.path.join(
+            CACHE_DIR, f".{track_id}.part-{os.getpid()}-{int(time.time())}"
+        )
         os.makedirs(tmp_dir, exist_ok=True)
         started = time.time()
         log.info("download start: %s", track_id)
 
         try:
-            with _download_slots:  # limit parallel downloads
+            with _download_slots:
                 asyncio.run(
-                    asyncio.wait_for(_spotiflac_download(track_id, tmp_dir), DOWNLOAD_TIMEOUT)
+                    asyncio.wait_for(
+                        _mornye_download(track_id, tmp_dir), DOWNLOAD_TIMEOUT
+                    )
                 )
         except asyncio.TimeoutError:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -576,7 +719,7 @@ def ensure_spotify_file(track_id, retry=False):
             raise RuntimeError(msg)
         except Exception as exc:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            msg = f"SpotiFLAC failed: {exc}"
+            msg = f"Mornye failed: {exc}"
             failure_cache.set(track_id, msg, FAIL_TTL)
             log.exception("download %s failed", track_id)
             raise RuntimeError(msg) from exc
@@ -584,12 +727,11 @@ def ensure_spotify_file(track_id, retry=False):
         path = _find_audio(tmp_dir)
         if not _valid(path):
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            msg = "Lossless file not found on any provider"
+            msg = "Lossless file not found on any installed Mornye extension/provider"
             failure_cache.set(track_id, msg, FAIL_TTL)
             log.error("download %s: %s", track_id, msg)
             raise RuntimeError(msg)
 
-        # Atomic publish: only complete downloads appear in the cache
         shutil.rmtree(final_dir, ignore_errors=True)
         os.replace(tmp_dir, final_dir)
         os.utime(final_dir, None)
@@ -625,7 +767,7 @@ def do_search():
         limit = 20
 
     try:
-        tracks = spotify_search(query, limit)
+        tracks = direct_search(query, limit)
     except SearchError as exc:
         return jsonify({"tracks": [], "error": str(exc)}), 502
     except Exception as exc:
@@ -655,20 +797,22 @@ def do_stream(identifier):
     fmt = "flac" if is_flac else ext.lstrip(".")
     label = quality_label(sr, bd) if is_flac else f"Lossless ({fmt.upper()})"
 
-    return jsonify({
-        "url": f"{base_url()}/file/{track_id}{ext}",
-        "format": fmt,
-        "quality": label,
-        "audioQuality": "LOSSLESS",
-        "codec": fmt,
-        "container": fmt,
-        "manifest": "none",
-        "encrypted": False,
-        "sampleRate": sr,
-        "bitDepth": bd,
-        "bitrate": None,
-        "audioMode": "stereo",
-    })
+    return jsonify(
+        {
+            "url": f"{base_url()}/file/{track_id}{ext}",
+            "format": fmt,
+            "quality": label,
+            "audioQuality": "LOSSLESS",
+            "codec": fmt,
+            "container": fmt,
+            "manifest": "none",
+            "encrypted": False,
+            "sampleRate": sr,
+            "bitDepth": bd,
+            "bitrate": None,
+            "audioMode": "stereo",
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -686,7 +830,9 @@ def manifest():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "name": MANIFEST["name"], "version": MANIFEST["version"]})
+    return jsonify(
+        {"ok": True, "name": MANIFEST["name"], "version": MANIFEST["version"]}
+    )
 
 
 @app.get("/search")
@@ -699,7 +845,6 @@ def stream(identifier):
     return do_stream(identifier)
 
 
-# Compatibility with older addon examples that used /stream?id=...
 @app.get("/stream")
 def stream_query():
     return do_stream(request.args.get("id"))
@@ -718,7 +863,7 @@ def serve_spotify_file(track_id):
         return jsonify({"error": str(exc)}), 404
 
     try:
-        os.utime(os.path.dirname(path), None)  # keep alive while playing
+        os.utime(os.path.dirname(path), None)
     except OSError:
         pass
 
@@ -726,39 +871,37 @@ def serve_spotify_file(track_id):
     return send_file(
         path,
         mimetype=MIME_TYPES.get(ext, "application/octet-stream"),
-        conditional=True,  # Range requests / seeking
+        conditional=True,
         max_age=0,
     )
 
 
 # --------------------------------------------------------------------------- #
-# Debug endpoints (no secrets are exposed)
+# Debug endpoints
 # --------------------------------------------------------------------------- #
+@app.get("/debug/mornye")
 @app.get("/debug/spotify")
-def debug_spotify():
+def debug_mornye():
     if not DEBUG_ENDPOINTS:
         abort(404)
 
     info = {
-        "client_id_set": bool(os.getenv("SPOTIFY_CLIENT_ID")),
-        "client_secret_set": bool(os.getenv("SPOTIFY_CLIENT_SECRET")),
         "public_url": os.getenv("PUBLIC_URL") or None,
+        "registries": MORNYE_REGISTRIES,
+        "services": MORNYE_SERVICES,
     }
-    for mod in ("spotipy", "SpotiFLAC"):
-        try:
-            __import__(mod)
-            info[f"{mod}_import"] = "ok"
-        except Exception as exc:
-            info[f"{mod}_import"] = f"FAILED: {exc!r}"
+    try:
+        import mornye
 
-    sp = get_spotipy()
-    info["spotipy_client"] = "ok" if sp else f"unavailable: {_sp_error}"
-    if sp:
-        try:
-            res = sp.search(q="blinding lights", type="track", limit=5)
-            info["test_search"] = f"ok, {len(res['tracks']['items'])} results"
-        except Exception as exc:
-            info["test_search"] = f"FAILED: {exc!r}"
+        info["mornye_import"] = "ok"
+    except Exception as exc:
+        info["mornye_import"] = f"FAILED: {exc!r}"
+
+    try:
+        res = direct_search("blinding lights", 5)
+        info["test_search"] = f"ok, {len(res)} results"
+    except Exception as exc:
+        info["test_search"] = f"FAILED: {exc!r}"
     return jsonify(info)
 
 
@@ -768,20 +911,22 @@ def debug_cache():
         abort(404)
     now = time.time()
     entries = cache_entries()
-    return jsonify({
-        "dir": CACHE_DIR,
-        "ttl_seconds": CACHE_TTL,
-        "max_mb": CACHE_MAX_BYTES // (1024 * 1024),
-        "total_mb": round(sum(s for _, s, _ in entries) / 1048576, 2),
-        "tracks": [
-            {
-                "id": name,
-                "size_mb": round(size / 1048576, 2),
-                "idle_seconds": int(now - mtime),
-            }
-            for mtime, size, name in sorted(entries, reverse=True)
-        ],
-    })
+    return jsonify(
+        {
+            "dir": CACHE_DIR,
+            "ttl_seconds": CACHE_TTL,
+            "max_mb": CACHE_MAX_BYTES // (1024 * 1024),
+            "total_mb": round(sum(s for _, s, _ in entries) / 1048576, 2),
+            "tracks": [
+                {
+                    "id": name,
+                    "size_mb": round(size / 1048576, 2),
+                    "idle_seconds": int(now - mtime),
+                }
+                for mtime, size, name in sorted(entries, reverse=True)
+            ],
+        }
+    )
 
 
 if __name__ == "__main__":
